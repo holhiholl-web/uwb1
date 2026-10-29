@@ -1,4 +1,4 @@
-name: Build UWB APK
+name: Build Wall Scanner APK
 
 on:
   push:
@@ -15,7 +15,11 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Generate Clean Project Structure
+      - name: Accept Android SDK Licenses
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+
+      - name: Generate Standalone RF Wall Radar Project
         run: |
           rm -rf *
           mkdir -p app/src/main/java/com/icar/uwbradar
@@ -41,7 +45,7 @@ jobs:
                   mavenCentral()
               }
           }
-          rootProject.name = "GalaxyUwbRadar"
+          rootProject.name = "ICARWallRadar"
           include(":app")
           EOF
 
@@ -63,11 +67,11 @@ jobs:
               compileSdk = 34
 
               defaultConfig {
-                  applicationId = "com.icar.uwbradar"
-                  minSdk = 31
+                  applicationId = "com.icar.wallradar"
+                  minSdk = 29
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 2
+                  versionName = "2.0"
               }
 
               compileOptions {
@@ -80,31 +84,26 @@ jobs:
           }
 
           dependencies {
-              implementation("androidx.core.uwb:uwb:1.0.0-alpha08")
-              implementation("com.google.android.gms:play-services-nearby:19.3.0")
               implementation("androidx.core:core-ktx:1.12.0")
               implementation("androidx.appcompat:appcompat:1.6.1")
-              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
           }
           EOF
 
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <uses-permission android:name="android.permission.UWB_RANGING" />
               <uses-permission android:name="android.permission.BLUETOOTH" />
               <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
-              <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+              <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
               <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-              <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
               <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
               <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
               <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
 
-              <uses-feature android:name="android.hardware.uwb" android:required="true" />
-
               <application
-                  android:label="ICAR UWB Radar"
+                  android:label="ICAR 공간전파 투과레이더"
                   android:theme="@style/Theme.AppCompat.NoActionBar">
                   <activity
                       android:name=".MainActivity"
@@ -123,301 +122,365 @@ jobs:
           package com.icar.uwbradar
 
           import android.Manifest
+          import android.annotation.SuppressLint
+          import android.bluetooth.BluetoothManager
+          import android.bluetooth.le.ScanCallback
+          import android.bluetooth.le.ScanResult
+          import android.bluetooth.le.ScanSettings
           import android.content.Context
           import android.graphics.*
+          import android.hardware.Sensor
+          import android.hardware.SensorEvent
+          import android.hardware.SensorEventListener
+          import android.hardware.SensorManager
+          import android.net.wifi.WifiManager
           import android.os.Build
           import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
           import android.view.Gravity
           import android.view.View
           import android.widget.*
           import androidx.appcompat.app.AppCompatActivity
           import androidx.core.app.ActivityCompat
-          import androidx.core.uwb.*
-          import com.google.android.gms.nearby.Nearby
-          import com.google.android.gms.nearby.connection.*
-          import kotlinx.coroutines.*
-          import kotlinx.coroutines.flow.collectLatest
-          import java.nio.ByteBuffer
-          import kotlin.math.cos
-          import kotlin.math.sin
+          import java.util.concurrent.ConcurrentHashMap
+          import kotlin.math.*
 
-          class MainActivity : AppCompatActivity() {
+          data class RfNode(
+              val id: String,
+              val label: String,
+              val type: String, // "BLE" or "WIFI"
+              var rssi: Int,
+              var smoothRssi: Float,
+              var fluctuation: Float, // 신호 요동치 (벽 너머 움직임 감지용)
+              var distance: Float,
+              val baseAngle: Float,
+              var lastSeen: Long
+          )
 
-              private lateinit var uwbManager: UwbManager
-              private lateinit var nearbyClient: ConnectionsClient
-              private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
-              private var uwbJob: Job? = null
+          class MainActivity : AppCompatActivity(), SensorEventListener {
 
-              private val SERVICE_ID = "com.icar.pure.uwb"
-              private val SESSION_ID = 9001
-              private val SESSION_KEY = byteArrayOf(0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08)
-
-              private var isController = true
-              private var sessionScope: UwbClientSessionScope? = null
-              private var controllerScope: UwbControllerSessionScope? = null
-
+              private val nodes = ConcurrentHashMap<String, RfNode>()
+              private lateinit var radarView: SpaceRadarView
               private lateinit var statusTv: TextView
-              private lateinit var metricsTv: TextView
-              private lateinit var radarView: RadarCanvasView
+              private lateinit var summaryTv: TextView
+
+              private lateinit var sensorManager: SensorManager
+              private var myHeading = 0f
+              private val accelReading = FloatArray(3)
+              private val magReading = FloatArray(3)
+              private val rotMatrix = FloatArray(9)
+              private val orientAngles = FloatArray(3)
+
+              private val uiHandler = Handler(Looper.getMainLooper())
+              private var isScanning = false
+              private var maxScaleMeters = 12f
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
-                  uwbManager = UwbManager.createInstance(this)
-                  nearbyClient = Nearby.getConnectionsClient(this)
-
-                  requestAllPermissions()
+                  sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
                   setupUi()
+                  requestPermissions()
               }
 
-              private fun requestAllPermissions() {
+              private fun requestPermissions() {
                   val perms = mutableListOf(
-                      Manifest.permission.UWB_RANGING,
                       Manifest.permission.ACCESS_FINE_LOCATION,
-                      Manifest.permission.ACCESS_COARSE_LOCATION
+                      Manifest.permission.ACCESS_COARSE_LOCATION,
+                      Manifest.permission.ACCESS_WIFI_STATE,
+                      Manifest.permission.CHANGE_WIFI_STATE
                   )
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                      perms.addAll(listOf(
-                          Manifest.permission.BLUETOOTH_SCAN,
-                          Manifest.permission.BLUETOOTH_ADVERTISE,
-                          Manifest.permission.BLUETOOTH_CONNECT
-                      ))
+                      perms.add(Manifest.permission.BLUETOOTH_SCAN)
+                      perms.add(Manifest.permission.BLUETOOTH_CONNECT)
                   }
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                       perms.add(Manifest.permission.NEARBY_WIFI_DEVICES)
                   }
-                  ActivityCompat.requestPermissions(this, perms.toTypedArray(), 100)
+                  ActivityCompat.requestPermissions(this, perms.toTypedArray(), 200)
               }
 
               private fun setupUi() {
                   val root = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
-                      setBackgroundColor(Color.parseColor("#080B10"))
-                      setPadding(40, 50, 40, 40)
+                      setBackgroundColor(Color.parseColor("#070A0F"))
+                      setPadding(36, 48, 36, 36)
                   }
 
                   val title = TextView(this).apply {
-                      text = "ICAR PURE UWB RADAR"
+                      text = "ICAR 공간·벽너머 전파 투과 레이더"
                       setTextColor(Color.parseColor("#38BDF8"))
-                      textSize = 20f
-                      gravity = Gravity.CENTER
+                      textSize = 19f
                       typeface = Typeface.DEFAULT_BOLD
+                      gravity = Gravity.CENTER
                   }
 
                   statusTv = TextView(this).apply {
-                      text = "하단 버튼으로 폰A(호스트) / 폰B(게스트) 시작"
+                      text = "파란점: 고정 신호  |  빨간파동: 벽너머 신호 출렁임(움직임 감지)"
                       setTextColor(Color.parseColor("#94A3B8"))
-                      textSize = 13f
+                      textSize = 12f
                       gravity = Gravity.CENTER
-                      setPadding(0, 12, 0, 24)
+                      setPadding(0, 10, 0, 20)
                   }
 
-                  radarView = RadarCanvasView(this).apply {
+                  radarView = SpaceRadarView(this).apply {
                       layoutParams = LinearLayout.LayoutParams(
                           LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
                       )
                   }
 
-                  metricsTv = TextView(this).apply {
-                      text = "거리: -- m   |   방위각: -- °   |   고도: -- °"
+                  summaryTv = TextView(this).apply {
+                      text = "감지된 투과 신호: 0개  |  움직임(출렁임) 경보: 0건"
                       setTextColor(Color.WHITE)
-                      textSize = 16f
-                      gravity = Gravity.CENTER
+                      textSize = 14f
                       typeface = Typeface.DEFAULT_BOLD
-                      setPadding(20, 32, 20, 32)
+                      gravity = Gravity.CENTER
+                      setPadding(16, 24, 16, 24)
                   }
 
-                  val btnRow = LinearLayout(this).apply {
-                      orientation = LinearLayout.HORIZONTAL
-                  }
+                  val btnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
 
-                  val btnHost = Button(this).apply {
-                      text = "폰A: 호스트 시작"
+                  val btnStart = Button(this).apply {
+                      text = "실시간 주변·벽너머 스캔 시작"
                       setBackgroundColor(Color.parseColor("#0284C7"))
                       setTextColor(Color.WHITE)
-                      layoutParams = LinearLayout.LayoutParams(0, 140, 1f).apply { rightMargin = 16 }
-                      setOnClickListener { startRole(true) }
+                      layoutParams = LinearLayout.LayoutParams(0, 135, 1.4f).apply { rightMargin = 16 }
+                      setOnClickListener { startSpaceScan() }
                   }
 
-                  val btnGuest = Button(this).apply {
-                      text = "폰B: 게스트 시작"
-                      setBackgroundColor(Color.parseColor("#4F46E5"))
+                  val btnScale = Button(this).apply {
+                      text = "반경: 12m"
+                      setBackgroundColor(Color.parseColor("#1E293B"))
                       setTextColor(Color.WHITE)
-                      layoutParams = LinearLayout.LayoutParams(0, 140, 1f)
-                      setOnClickListener { startRole(false) }
+                      layoutParams = LinearLayout.LayoutParams(0, 135, 0.8f)
+                      setOnClickListener {
+                          maxScaleMeters = when (maxScaleMeters) {
+                              6f -> 12f
+                              12f -> 25f
+                              else -> 6f
+                          }
+                          text = "반경: ${maxScaleMeters.toInt()}m"
+                          radarView.maxRange = maxScaleMeters
+                      }
                   }
 
-                  btnRow.addView(btnHost)
-                  btnRow.addView(btnGuest)
+                  btnRow.addView(btnStart)
+                  btnRow.addView(btnScale)
 
                   root.addView(title)
                   root.addView(statusTv)
                   root.addView(radarView)
-                  root.addView(metricsTv)
+                  root.addView(summaryTv)
                   root.addView(btnRow)
 
                   setContentView(root)
               }
 
-              private fun startRole(asController: Boolean) {
-                  uwbJob?.cancel()
-                  nearbyClient.stopAdvertising()
-                  nearbyClient.stopDiscovery()
-                  nearbyClient.stopAllEndpoints()
-                  isController = asController
+              @SuppressLint("MissingPermission")
+              private fun startSpaceScan() {
+                  if (isScanning) return
+                  isScanning = true
+                  statusTv.text = "초고감도 전파 투과 스캔 가동 중! (폰을 천천히 돌려보세요)"
+                  statusTv.setTextColor(Color.parseColor("#4ADE80"))
 
-                  scope.launch {
+                  // 1. BLE 초고속 저지연 스캔
+                  try {
+                      val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+                      val scanner = btManager.adapter?.bluetoothLeScanner
+                      val settings = ScanSettings.Builder()
+                          .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                          .build()
+                      scanner?.startScan(null, settings, bleCallback)
+                  } catch (e: Exception) {
+                      statusTv.text = "블루투스 및 위치(GPS) 스위치를 켜고 권한을 허용해주세요."
+                  }
+
+                  // 2. Wi-Fi 전파 주기적 스캔 및 화면 갱신 루프
+                  uiHandler.post(updateRunnable)
+              }
+
+              private val bleCallback = object : ScanCallback() {
+                  @SuppressLint("MissingPermission")
+                  override fun onScanResult(callbackType: Int, result: ScanResult) {
+                      val id = result.device.address ?: return
+                      val name = result.device.name ?: "신호원(${id.takeLast(5)})"
+                      val rssi = result.rssi
+                      updateNode(id, name, "BLE", rssi)
+                  }
+              }
+
+              @SuppressLint("MissingPermission")
+              private val updateRunnable = object : Runnable {
+                  override fun run() {
+                      if (!isScanning) return
+
                       try {
-                          if (asController) {
-                              statusTv.text = "UWB 호스트 준비 완료. 상대 갤럭시 탐색 중..."
-                              controllerScope = uwbManager.controllerSessionScope()
-                              sessionScope = controllerScope
-                              val opt = DiscoveryOptions.Builder().setStrategy(Strategy.P2P_POINT_TO_POINT).build()
-                              nearbyClient.startDiscovery(SERVICE_ID, discoveryCb, opt)
-                          } else {
-                              statusTv.text = "UWB 게스트 준비 완료. 호스트 신호 대기 중..."
-                              sessionScope = uwbManager.controleeSessionScope()
-                              val opt = AdvertisingOptions.Builder().setStrategy(Strategy.P2P_POINT_TO_POINT).build()
-                              nearbyClient.startAdvertising("UWB_Guest", SERVICE_ID, connCb, opt)
+                          val wifiMgr = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                          wifiMgr.startScan()
+                          for (w in wifiMgr.scanResults) {
+                              val id = w.BSSID ?: continue
+                              val ssid = if (w.SSID.isNullOrBlank()) "WiFi(${id.takeLast(5)})" else w.SSID
+                              updateNode(id, ssid, "WIFI", w.level)
                           }
-                      } catch (e: Exception) {
-                          statusTv.text = "오류: 기기 설정에서 초광대역(UWB)을 켜주세요."
-                      }
+                      } catch (e: Exception) {}
+
+                      // 오래된 신호 정리 (8초 이상 미수신 시 제거)
+                      val now = System.currentTimeMillis()
+                      nodes.entries.removeIf { now - it.value.lastSeen > 8000 }
+
+                      val list = nodes.values.toList()
+                      val movingCount = list.count { it.fluctuation >= 3.2f }
+                      summaryTv.text = "벽·주변 감지 신호: ${list.size}개   |   신호 출렁임(움직임): ${movingCount}건"
+
+                      radarView.updateData(list, myHeading)
+                      uiHandler.postDelayed(this, 120)
                   }
               }
 
-              private val discoveryCb = object : EndpointDiscoveryCallback() {
-                  override fun onEndpointFound(id: String, info: DiscoveredEndpointInfo) {
-                      statusTv.text = "상대 갤럭시 발견! UWB 채널 교환 중..."
-                      nearbyClient.requestConnection("UWB_Host", id, connCb)
-                  }
-                  override fun onEndpointLost(id: String) {}
-              }
+              private fun updateNode(id: String, label: String, type: String, newRssi: Int) {
+                  val now = System.currentTimeMillis()
+                  val dist = estimateDistance(newRssi)
+                  val existing = nodes[id]
 
-              private val connCb = object : ConnectionLifecycleCallback() {
-                  override fun onConnectionInitiated(id: String, info: ConnectionInfo) {
-                      nearbyClient.acceptConnection(id, payloadCb)
-                  }
-                  override fun onConnectionResult(id: String, res: ConnectionResolution) {
-                      if (res.status.isSuccess) {
-                          nearbyClient.stopAdvertising()
-                          nearbyClient.stopDiscovery()
-                          val localAddr = sessionScope?.localAddress?.address ?: return
-                          if (isController) {
-                              val ch = controllerScope?.uwbComplexChannel ?: return
-                              val buf = ByteBuffer.allocate(1 + localAddr.size + 8)
-                              buf.put(localAddr.size.toByte()).put(localAddr).putInt(ch.channel).putInt(ch.preambleIndex)
-                              nearbyClient.sendPayload(id, Payload.fromBytes(buf.array()))
-                          } else {
-                              val buf = ByteBuffer.allocate(1 + localAddr.size)
-                              buf.put(localAddr.size.toByte()).put(localAddr)
-                              nearbyClient.sendPayload(id, Payload.fromBytes(buf.array()))
-                          }
-                      }
-                  }
-                  override fun onDisconnected(id: String) {}
-              }
-
-              private val payloadCb = object : PayloadCallback() {
-                  override fun onPayloadReceived(id: String, payload: Payload) {
-                      val bytes = payload.asBytes() ?: return
-                      val buf = ByteBuffer.wrap(bytes)
-                      val len = buf.get().toInt()
-                      val peerAddr = ByteArray(len)
-                      buf.get(peerAddr)
-
-                      if (isController) {
-                          val ch = controllerScope?.uwbComplexChannel ?: return
-                          runUwbRanging(peerAddr, ch.channel, ch.preambleIndex)
-                      } else {
-                          runUwbRanging(peerAddr, buf.int, buf.int)
-                      }
-                  }
-                  override fun onPayloadTransferUpdate(id: String, u: PayloadTransferUpdate) {}
-              }
-
-              private fun runUwbRanging(peerAddr: ByteArray, channel: Int, preamble: Int) {
-                  uwbJob?.cancel()
-                  uwbJob = scope.launch {
-                      val s = sessionScope ?: return@launch
-                      val params = RangingParameters(
-                          uwbConfigType = RangingParameters.CONFIG_UNICAST_DS_TWR,
-                          sessionId = SESSION_ID,
-                          subSessionId = 0,
-                          sessionKeyInfo = SESSION_KEY,
-                          subSessionKeyInfo = null,
-                          complexChannel = UwbComplexChannel(channel, preamble),
-                          peerDevices = listOf(UwbDevice(UwbAddress(peerAddr))),
-                          updateRateType = RangingParameters.RANGING_UPDATE_RATE_FREQUENT
-                      )
-
-                      statusTv.text = "UWB 하드웨어 실시간 추적 중!"
-                      statusTv.setTextColor(Color.parseColor("#4ADE80"))
-
-                      s.prepareSession(params).collectLatest { result ->
-                          when (result) {
-                              is RangingResult.RangingResultPosition -> {
-                                  val pos = result.position
-                                  val d = pos.distance?.value ?: 0f
-                                  val az = pos.azimuth?.value ?: 0f
-                                  val el = pos.elevation?.value ?: 0f
-                                  metricsTv.text = String.format("거리: %.2f m  |  방위각: %+.1f°  |  고도: %+.1f°", d, az, el)
-                                  radarView.updateTarget(true, d, az)
-                              }
-                              is RangingResult.RangingResultPeerDisconnected -> {
-                                  statusTv.text = "UWB 연결 끊김"
-                                  radarView.updateTarget(false, 0f, 0f)
-                              }
-                          }
-                      }
+                  if (existing == null) {
+                      // 고유 MAC 주소를 기반으로 공간 방향각 배치 + 나침반 회전 연동
+                      val hashAngle = ((id.hashCode() and 0x7FFFFFFF) % 360).toFloat()
+                      nodes[id] = RfNode(id, label, type, newRssi, newRssi.toFloat(), 0f, dist, hashAngle, now)
+                  } else {
+                      val diff = abs(newRssi - existing.smoothRssi)
+                      existing.fluctuation = existing.fluctuation * 0.7f + diff * 0.3f
+                      existing.smoothRssi = existing.smoothRssi * 0.75f + newRssi * 0.25f
+                      existing.rssi = newRssi
+                      existing.distance = estimateDistance(existing.smoothRssi.toInt())
+                      existing.lastSeen = now
                   }
               }
+
+              // 전파 감쇠 공식(Path-Loss)으로 벽 너머 거리(m) 산출
+              private fun estimateDistance(rssi: Int): Float {
+                  val txPower = -59.0
+                  val n = 2.6 // 실내 및 벽 투과 환경 감쇠 지수
+                  val d = 10.0.pow((txPower - rssi) / (10.0 * n)).toFloat()
+                  return d.coerceIn(0.3f, 35.0f)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.also {
+                      sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+                  }
+                  sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)?.also {
+                      sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+                  }
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  sensorManager.unregisterListener(this)
+              }
+
+              override fun onSensorChanged(event: SensorEvent) {
+                  if (event.sensor.type == Sensor.TYPE_ACCELEROMETER) {
+                      System.arraycopy(event.values, 0, accelReading, 0, accelReading.size)
+                  } else if (event.sensor.type == Sensor.TYPE_MAGNETIC_FIELD) {
+                      System.arraycopy(event.values, 0, magReading, 0, magReading.size)
+                  }
+                  if (SensorManager.getRotationMatrix(rotMatrix, null, accelReading, magReading)) {
+                      SensorManager.getOrientation(rotMatrix, orientAngles)
+                      val deg = (Math.toDegrees(orientAngles[0].toDouble()).toFloat() + 360f) % 360f
+                      myHeading = deg
+                  }
+              }
+
+              override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
           }
 
-          class RadarCanvasView(context: Context) : View(context) {
-              private var active = false
-              private var dist = 0f
-              private var azimuth = 0f
-              private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+          class SpaceRadarView(context: Context) : View(context) {
+              var maxRange = 12f
+              private var nodeList = emptyList<RfNode>()
+              private var heading = 0f
+              private var sweepAngle = 0f
+
+              private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                   color = Color.parseColor("#1E293B")
                   style = Paint.Style.STROKE
-                  strokeWidth = 4f
+                  strokeWidth = 3f
               }
-              private val targetPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                  color = Color.parseColor("#4ADE80")
+              private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.parseColor("#CBD5E1")
+                  textSize = 26f
+                  typeface = Typeface.DEFAULT_BOLD
+              }
+              private val subTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.parseColor("#64748B")
+                  textSize = 22f
+              }
+              private val staticPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.parseColor("#38BDF8")
                   style = Paint.Style.FILL
               }
-              private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                  color = Color.parseColor("#38BDF8")
-                  strokeWidth = 6f
+              private val alertPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.parseColor("#EF4444")
+                  style = Paint.Style.FILL
+              }
+              private val wavePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.parseColor("#F87171")
+                  style = Paint.Style.STROKE
+                  strokeWidth = 5f
               }
 
-              fun updateTarget(isActive: Boolean, d: Float, az: Float) {
-                  active = isActive
-                  dist = d
-                  azimuth = az
+              fun updateData(list: List<RfNode>, currentHeading: Float) {
+                  nodeList = list.sortedBy { it.distance }
+                  heading = currentHeading
+                  sweepAngle = (sweepAngle + 6f) % 360f
                   invalidate()
               }
 
               override fun onDraw(canvas: Canvas) {
                   super.onDraw(canvas)
                   val cx = width / 2f
-                  val cy = height * 0.82f
-                  val maxR = width * 0.44f
+                  val cy = height / 2f
+                  val maxR = min(width, height) * 0.44f
 
+                  // 거리 가이드 링 (25%, 50%, 75%, 100%)
                   listOf(0.25f, 0.5f, 0.75f, 1.0f).forEach { r ->
-                      canvas.drawCircle(cx, cy, maxR * r, gridPaint)
+                      val radPx = maxR * r
+                      canvas.drawCircle(cx, cy, radPx, ringPaint)
+                      canvas.drawText("${(maxRange * r).toInt()}m", cx + 10f, cy - radPx + 24f, subTextPaint)
                   }
+
+                  // 십자선
+                  canvas.drawLine(cx - maxR, cy, cx + maxR, cy, ringPaint)
+                  canvas.drawLine(cx, cy - maxR, cx, cy + maxR, ringPaint)
+
+                  // 중앙 내 폰 위치
                   canvas.drawCircle(cx, cy, 14f, Paint().apply { color = Color.WHITE })
 
-                  if (active) {
-                      val normD = (dist / 6f).coerceIn(0.02f, 1f)
+                  // 감지된 벽 너머 및 주변 전파 신호원 렌더링
+                  for (node in nodeList) {
+                      val normD = (node.distance / maxRange).coerceIn(0.08f, 1.0f)
                       val rPx = normD * maxR
-                      val rad = Math.toRadians(azimuth.toDouble())
+                      val relAngle = (node.baseAngle - heading + 360f) % 360f
+                      val rad = Math.toRadians(relAngle.toDouble())
+
                       val tx = cx + (rPx * sin(rad)).toFloat()
                       val ty = cy - (rPx * cos(rad)).toFloat()
 
-                      canvas.drawLine(cx, cy, tx, ty, linePaint)
-                      canvas.drawCircle(tx, ty, 28f, targetPaint)
+                      // 신호가 크게 출렁이면(사람 이동/간섭) 빨간색 파동, 고정되어 있으면 파란색
+                      val isMoving = node.fluctuation >= 3.2f
+                      if (isMoving) {
+                          canvas.drawCircle(tx, ty, 38f + node.fluctuation * 4f, wavePaint)
+                          canvas.drawCircle(tx, ty, 20f, alertPaint)
+                      } else {
+                          canvas.drawCircle(tx, ty, 15f, staticPaint)
+                      }
+
+                      canvas.drawText(
+                          "${node.label.take(10)} (${String.format("%.1f", node.distance)}m)",
+                          tx + 22f,
+                          ty + 8f,
+                          textPaint
+                      )
                   }
               }
           }
@@ -426,7 +489,7 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
         with:
-          gradle-version: '8.6'
+          gradle-version: '8.4'
           cache-disabled: true
 
       - name: Build Debug APK
@@ -435,5 +498,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Galaxy-UWB-Radar-APK
+          name: ICAR-Wall-Scanner-APK
           path: app/build/outputs/apk/debug/app-debug.apk
