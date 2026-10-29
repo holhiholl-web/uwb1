@@ -1,4 +1,4 @@
-name: Build Wall Scanner APK
+name: Build Wall Scanner v3 APK
 
 on:
   push:
@@ -19,7 +19,7 @@ jobs:
         run: |
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
-      - name: Generate Standalone RF Wall Radar Project
+      - name: Generate v3 Project Structure
         run: |
           rm -rf *
           mkdir -p app/src/main/java/com/icar/uwbradar
@@ -45,7 +45,7 @@ jobs:
                   mavenCentral()
               }
           }
-          rootProject.name = "ICARWallRadar"
+          rootProject.name = "ICARWallRadarV3"
           include(":app")
           EOF
 
@@ -70,8 +70,8 @@ jobs:
                   applicationId = "com.icar.wallradar"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 2
-                  versionName = "2.0"
+                  versionCode = 3
+                  versionName = "3.0"
               }
 
               compileOptions {
@@ -101,9 +101,10 @@ jobs:
               <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
               <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
               <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
 
               <application
-                  android:label="ICAR 공간전파 투과레이더"
+                  android:label="ICAR 공간레이더 PRO"
                   android:theme="@style/Theme.AppCompat.NoActionBar">
                   <activity
                       android:name=".MainActivity"
@@ -134,50 +135,64 @@ jobs:
           import android.hardware.SensorEventListener
           import android.hardware.SensorManager
           import android.net.wifi.WifiManager
-          import android.os.Build
-          import android.os.Bundle
-          import android.os.Handler
-          import android.os.Looper
-          import android.view.Gravity
-          import android.view.View
+          import android.os.*
+          import android.view.*
           import android.widget.*
           import androidx.appcompat.app.AppCompatActivity
           import androidx.core.app.ActivityCompat
           import java.util.concurrent.ConcurrentHashMap
           import kotlin.math.*
 
+          // 층 구분 열거형: 같은층(BLUE), 위층(YELLOW), 아래층(GREEN)
+          enum class FloorLevel(val label: String, val colorHex: String) {
+              SAME("동일층", "#38BDF8"),   // 블루
+              UPPER("위층▲", "#FACC15"),   // 노란색
+              LOWER("아래층▼", "#4ADE80")  // 녹색
+          }
+
           data class RfNode(
               val id: String,
               val label: String,
-              val type: String, // "BLE" or "WIFI"
+              val type: String,
+              val freqMhz: Int,
               var rssi: Int,
               var smoothRssi: Float,
-              var fluctuation: Float, // 신호 요동치 (벽 너머 움직임 감지용)
+              var fluctuation: Float,
               var distance: Float,
               val baseAngle: Float,
+              var floor: FloorLevel,
+              var pitchCorrelation: Float,
               var lastSeen: Long
           )
 
           class MainActivity : AppCompatActivity(), SensorEventListener {
 
               private val nodes = ConcurrentHashMap<String, RfNode>()
-              private lateinit var radarView: SpaceRadarView
+              private lateinit var radarView: InteractiveRadarView
+              private lateinit var listContainer: LinearLayout
               private lateinit var statusTv: TextView
-              private lateinit var summaryTv: TextView
+              private lateinit var btnBooster: Button
 
               private lateinit var sensorManager: SensorManager
               private var myHeading = 0f
-              private val accelReading = FloatArray(3)
-              private val magReading = FloatArray(3)
+              private var myPitch = 0f // 폰 위아래 기울기 (층 감지 보정용)
+              private val accel = FloatArray(3)
+              private val mag = FloatArray(3)
               private val rotMatrix = FloatArray(9)
-              private val orientAngles = FloatArray(3)
+              private val orient = FloatArray(3)
 
               private val uiHandler = Handler(Looper.getMainLooper())
               private var isScanning = false
-              private var maxScaleMeters = 12f
+              private var isBoosterMode = false
+              private var selectedNodeId: String? = null
+
+              private var wakeLock: PowerManager.WakeLock? = null
+              private var wifiLock: WifiManager.WifiLock? = null
+              private var lastBleRestart = 0L
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                   sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
                   setupUi()
                   requestPermissions()
@@ -197,122 +212,217 @@ jobs:
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                       perms.add(Manifest.permission.NEARBY_WIFI_DEVICES)
                   }
-                  ActivityCompat.requestPermissions(this, perms.toTypedArray(), 200)
+                  ActivityCompat.requestPermissions(this, perms.toTypedArray(), 300)
               }
 
               private fun setupUi() {
                   val root = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                       setBackgroundColor(Color.parseColor("#070A0F"))
-                      setPadding(36, 48, 36, 36)
+                      setPadding(24, 36, 24, 24)
                   }
 
+                  // 상단 타이틀 & 범례
                   val title = TextView(this).apply {
-                      text = "ICAR 공간·벽너머 전파 투과 레이더"
+                      text = "ICAR 공간·벽면 투과 레이더 v3.0"
                       setTextColor(Color.parseColor("#38BDF8"))
-                      textSize = 19f
+                      textSize = 17f
                       typeface = Typeface.DEFAULT_BOLD
                       gravity = Gravity.CENTER
                   }
 
-                  statusTv = TextView(this).apply {
-                      text = "파란점: 고정 신호  |  빨간파동: 벽너머 신호 출렁임(움직임 감지)"
-                      setTextColor(Color.parseColor("#94A3B8"))
-                      textSize = 12f
+                  val legend = TextView(this).apply {
+                      text = "● 동일층(블루)  ● 위층(노랑)  ● 아래층(녹색)  〰 벽면전파굴절"
+                      setTextColor(Color.parseColor("#CBD5E1"))
+                      textSize = 11.5f
                       gravity = Gravity.CENTER
-                      setPadding(0, 10, 0, 20)
+                      setPadding(0, 6, 0, 8)
                   }
 
-                  radarView = SpaceRadarView(this).apply {
+                  statusTv = TextView(this).apply {
+                      text = "두 손가락으로 레이더 확대/축소 가능 | 좌측 리스트 상하 스크롤"
+                      setTextColor(Color.parseColor("#94A3B8"))
+                      textSize = 11f
+                      gravity = Gravity.CENTER
+                      setPadding(0, 0, 0, 14)
+                  }
+
+                  // 중단 메인 영역: [좌측 10개 단위 스크롤 리스트 (38%)] + [우측 멀티터치 레이더 (62%)]
+                  val middleRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
                       layoutParams = LinearLayout.LayoutParams(
                           LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
                       )
                   }
 
-                  summaryTv = TextView(this).apply {
-                      text = "감지된 투과 신호: 0개  |  움직임(출렁임) 경보: 0건"
-                      setTextColor(Color.WHITE)
-                      textSize = 14f
-                      typeface = Typeface.DEFAULT_BOLD
-                      gravity = Gravity.CENTER
-                      setPadding(16, 24, 16, 24)
-                  }
-
-                  val btnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-
-                  val btnStart = Button(this).apply {
-                      text = "실시간 주변·벽너머 스캔 시작"
-                      setBackgroundColor(Color.parseColor("#0284C7"))
-                      setTextColor(Color.WHITE)
-                      layoutParams = LinearLayout.LayoutParams(0, 135, 1.4f).apply { rightMargin = 16 }
-                      setOnClickListener { startSpaceScan() }
-                  }
-
-                  val btnScale = Button(this).apply {
-                      text = "반경: 12m"
-                      setBackgroundColor(Color.parseColor("#1E293B"))
-                      setTextColor(Color.WHITE)
-                      layoutParams = LinearLayout.LayoutParams(0, 135, 0.8f)
-                      setOnClickListener {
-                          maxScaleMeters = when (maxScaleMeters) {
-                              6f -> 12f
-                              12f -> 25f
-                              else -> 6f
-                          }
-                          text = "반경: ${maxScaleMeters.toInt()}m"
-                          radarView.maxRange = maxScaleMeters
+                  // 좌측 리스트 패널
+                  val leftPanel = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.parseColor("#0F172A"))
+                      setPadding(12, 12, 12, 12)
+                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 0.40f).apply {
+                          rightMargin = 12
                       }
                   }
 
-                  btnRow.addView(btnStart)
-                  btnRow.addView(btnScale)
+                  val listHeader = TextView(this).apply {
+                      text = "감지 목록 (스크롤)"
+                      setTextColor(Color.parseColor("#38BDF8"))
+                      textSize = 12f
+                      typeface = Typeface.DEFAULT_BOLD
+                      setPadding(4, 0, 4, 8)
+                  }
+
+                  val scrollView = ScrollView(this).apply {
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.MATCH_PARENT
+                      )
+                      isVerticalScrollBarEnabled = true
+                  }
+
+                  listContainer = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                  }
+                  scrollView.addView(listContainer)
+                  leftPanel.addView(listHeader)
+                  leftPanel.addView(scrollView)
+
+                  // 우측 멀티터치 줌 레이더 뷰
+                  radarView = InteractiveRadarView(this).apply {
+                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 0.60f)
+                  }
+
+                  middleRow.addView(leftPanel)
+                  middleRow.addView(radarView)
+
+                  // 하단 컨트롤 버튼 바
+                  val btnRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      setPadding(0, 16, 0, 0)
+                  }
+
+                  val btnScan = Button(this).apply {
+                      text = "스캔 시작"
+                      setBackgroundColor(Color.parseColor("#0284C7"))
+                      setTextColor(Color.WHITE)
+                      textSize = 13f
+                      layoutParams = LinearLayout.LayoutParams(0, 125, 1f).apply { rightMargin = 10 }
+                      setOnClickListener { startRadarScan() }
+                  }
+
+                  btnBooster = Button(this).apply {
+                      text = "⚡ 부스터: OFF"
+                      setBackgroundColor(Color.parseColor("#334155"))
+                      setTextColor(Color.WHITE)
+                      textSize = 13f
+                      layoutParams = LinearLayout.LayoutParams(0, 125, 1.1f).apply { rightMargin = 10 }
+                      setOnClickListener { toggleBoosterMode() }
+                  }
+
+                  val btnResetZoom = Button(this).apply {
+                      text = "줌 초기화"
+                      setBackgroundColor(Color.parseColor("#1E293B"))
+                      setTextColor(Color.parseColor("#CBD5E1"))
+                      textSize = 12f
+                      layoutParams = LinearLayout.LayoutParams(0, 125, 0.75f)
+                      setOnClickListener { radarView.resetView() }
+                  }
+
+                  btnRow.addView(btnScan)
+                  btnRow.addView(btnBooster)
+                  btnRow.addView(btnResetZoom)
 
                   root.addView(title)
+                  root.addView(legend)
                   root.addView(statusTv)
-                  root.addView(radarView)
-                  root.addView(summaryTv)
+                  root.addView(middleRow)
                   root.addView(btnRow)
 
                   setContentView(root)
               }
 
-              @SuppressLint("MissingPermission")
-              private fun startSpaceScan() {
-                  if (isScanning) return
-                  isScanning = true
-                  statusTv.text = "초고감도 전파 투과 스캔 가동 중! (폰을 천천히 돌려보세요)"
-                  statusTv.setTextColor(Color.parseColor("#4ADE80"))
+              @SuppressLint("MissingPermission", "WakelockTimeout")
+              private fun toggleBoosterMode() {
+                  isBoosterMode = !isBoosterMode
+                  if (isBoosterMode) {
+                      btnBooster.text = "⚡ 부스터: ON (최대출력)"
+                      btnBooster.setBackgroundColor(Color.parseColor("#DC2626"))
+                      statusTv.text = "⚡ 부스터 가동! 하드웨어 절전 해제 및 초고빈도 연속 전파 스캔 중"
+                      statusTv.setTextColor(Color.parseColor("#F87171"))
 
-                  // 1. BLE 초고속 저지연 스캔
-                  try {
-                      val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-                      val scanner = btManager.adapter?.bluetoothLeScanner
-                      val settings = ScanSettings.Builder()
-                          .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-                          .build()
-                      scanner?.startScan(null, settings, bleCallback)
-                  } catch (e: Exception) {
-                      statusTv.text = "블루투스 및 위치(GPS) 스위치를 켜고 권한을 허용해주세요."
+                      val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                      wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ICAR:BoosterWakeLock").apply { acquire() }
+
+                      val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                      wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "ICAR:BoosterWifiLock").apply { acquire() }
+
+                      if (!isScanning) startRadarScan() else restartBleScanner()
+                  } else {
+                      btnBooster.text = "⚡ 부스터: OFF"
+                      btnBooster.setBackgroundColor(Color.parseColor("#334155"))
+                      statusTv.text = "일반 스캔 모드로 전환됨"
+                      statusTv.setTextColor(Color.parseColor("#4ADE80"))
+
+                      try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (e: Exception) {}
+                      try { if (wifiLock?.isHeld == true) wifiLock?.release() } catch (e: Exception) {}
+                      if (isScanning) restartBleScanner()
                   }
+              }
 
-                  // 2. Wi-Fi 전파 주기적 스캔 및 화면 갱신 루프
-                  uiHandler.post(updateRunnable)
+              @SuppressLint("MissingPermission")
+              private fun startRadarScan() {
+                  isScanning = true
+                  statusTv.text = if (isBoosterMode) "⚡ 부스터 풀파워 스캔 가동 중!" else "실시간 공간·벽면 스캔 가동 중! (폰을 위아래로 기울이면 층 구분이 정밀해집니다)"
+                  statusTv.setTextColor(Color.parseColor("#4ADE80"))
+                  restartBleScanner()
+                  uiHandler.removeCallbacks(scanLoop)
+                  uiHandler.post(scanLoop)
+              }
+
+              @SuppressLint("MissingPermission")
+              private fun restartBleScanner() {
+                  try {
+                      val btMgr = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+                      val scanner = btMgr.adapter?.bluetoothLeScanner ?: return
+                      scanner.stopScan(bleCallback)
+
+                      val builder = ScanSettings.Builder()
+                          .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                          .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+
+                      if (isBoosterMode) {
+                          builder.setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
+                          builder.setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
+                          builder.setReportDelay(0L)
+                      }
+                      scanner.startScan(null, builder.build(), bleCallback)
+                      lastBleRestart = System.currentTimeMillis()
+                  } catch (e: Exception) {
+                      statusTv.text = "블루투스 및 위치(GPS) 권한과 스위치를 켜주세요."
+                  }
               }
 
               private val bleCallback = object : ScanCallback() {
                   @SuppressLint("MissingPermission")
                   override fun onScanResult(callbackType: Int, result: ScanResult) {
                       val id = result.device.address ?: return
-                      val name = result.device.name ?: "신호원(${id.takeLast(5)})"
-                      val rssi = result.rssi
-                      updateNode(id, name, "BLE", rssi)
+                      val rawName = result.device.name
+                      val name = if (rawName.isNullOrBlank()) "BLE(${id.takeLast(5)})" else rawName
+                      updateNode(id, name, "BLE", 2400, result.rssi)
                   }
               }
 
               @SuppressLint("MissingPermission")
-              private val updateRunnable = object : Runnable {
+              private val scanLoop = object : Runnable {
                   override fun run() {
                       if (!isScanning) return
+
+                      val now = System.currentTimeMillis()
+                      // 부스터 모드일 때는 안드로이드 스캔 쓰로틀링 방지를 위해 2.8초마다 BLE 스캐너 강제 재점화
+                      if (isBoosterMode && now - lastBleRestart > 2800) {
+                          restartBleScanner()
+                      }
 
                       try {
                           val wifiMgr = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
@@ -320,183 +430,51 @@ jobs:
                           for (w in wifiMgr.scanResults) {
                               val id = w.BSSID ?: continue
                               val ssid = if (w.SSID.isNullOrBlank()) "WiFi(${id.takeLast(5)})" else w.SSID
-                              updateNode(id, ssid, "WIFI", w.level)
+                              updateNode(id, ssid, "WIFI", w.frequency, w.level)
                           }
                       } catch (e: Exception) {}
 
-                      // 오래된 신호 정리 (8초 이상 미수신 시 제거)
-                      val now = System.currentTimeMillis()
-                      nodes.entries.removeIf { now - it.value.lastSeen > 8000 }
+                      val expireMs = if (isBoosterMode) 12000L else 8000L
+                      nodes.entries.removeIf { now - it.value.lastSeen > expireMs }
 
-                      val list = nodes.values.toList()
-                      val movingCount = list.count { it.fluctuation >= 3.2f }
-                      summaryTv.text = "벽·주변 감지 신호: ${list.size}개   |   신호 출렁임(움직임): ${movingCount}건"
+                      val sorted = nodes.values.sortedBy { it.distance }
+                      updateLeftScrollList(sorted)
+                      radarView.updateData(sorted, myHeading, selectedNodeId)
 
-                      radarView.updateData(list, myHeading)
-                      uiHandler.postDelayed(this, 120)
+                      val interval = if (isBoosterMode) 65L else 140L
+                      uiHandler.postDelayed(this, interval)
                   }
               }
 
-              private fun updateNode(id: String, label: String, type: String, newRssi: Int) {
+              private fun updateNode(id: String, label: String, type: String, freq: Int, newRssi: Int) {
                   val now = System.currentTimeMillis()
-                  val dist = estimateDistance(newRssi)
+                  val dist = estimateDistance(newRssi, freq)
                   val existing = nodes[id]
 
                   if (existing == null) {
-                      // 고유 MAC 주소를 기반으로 공간 방향각 배치 + 나침반 회전 연동
                       val hashAngle = ((id.hashCode() and 0x7FFFFFFF) % 360).toFloat()
-                      nodes[id] = RfNode(id, label, type, newRssi, newRssi.toFloat(), 0f, dist, hashAngle, now)
+                      val initialFloor = classifyFloor(newRssi, 1.5f, freq, 0f, id)
+                      nodes[id] = RfNode(id, label, type, freq, newRssi, newRssi.toFloat(), 1.0f, dist, hashAngle, initialFloor, 0f, now)
                   } else {
-                      val diff = abs(newRssi - existing.smoothRssi)
-                      existing.fluctuation = existing.fluctuation * 0.7f + diff * 0.3f
-                      existing.smoothRssi = existing.smoothRssi * 0.75f + newRssi * 0.25f
+                      val deltaRssi = newRssi - existing.smoothRssi
+                      val diff = abs(deltaRssi)
+                      existing.fluctuation = existing.fluctuation * 0.65f + diff * 0.35f
+                      existing.smoothRssi = existing.smoothRssi * 0.72f + newRssi * 0.28f
                       existing.rssi = newRssi
-                      existing.distance = estimateDistance(existing.smoothRssi.toInt())
+                      existing.distance = estimateDistance(existing.smoothRssi.toInt(), freq)
+
+                      // 폰을 위(천장, myPitch < -15)나 아래(바닥, myPitch > 15)로 기울일 때 신호 증감 상관관계 누적
+                      if (abs(myPitch) > 12f) {
+                          val pitchSign = if (myPitch < 0) 1f else -1f // 위를 향하면 +1, 아래를 향하면 -1
+                          existing.pitchCorrelation = (existing.pitchCorrelation * 0.85f) + (deltaRssi * pitchSign * 0.15f)
+                      }
+
+                      existing.floor = classifyFloor(existing.smoothRssi.toInt(), existing.fluctuation, freq, existing.pitchCorrelation, id)
                       existing.lastSeen = now
                   }
               }
 
-              // 전파 감쇠 공식(Path-Loss)으로 벽 너머 거리(m) 산출
-              private fun estimateDistance(rssi: Int): Float {
-                  val txPower = -59.0
-                  val n = 2.6 // 실내 및 벽 투과 환경 감쇠 지수
-                  val d = 10.0.pow((txPower - rssi) / (10.0 * n)).toFloat()
-                  return d.coerceIn(0.3f, 35.0f)
-              }
-
-              override fun onResume() {
-                  super.onResume()
-                  sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.also {
-                      sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
-                  }
-                  sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)?.also {
-                      sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
-                  }
-              }
-
-              override fun onPause() {
-                  super.onPause()
-                  sensorManager.unregisterListener(this)
-              }
-
-              override fun onSensorChanged(event: SensorEvent) {
-                  if (event.sensor.type == Sensor.TYPE_ACCELEROMETER) {
-                      System.arraycopy(event.values, 0, accelReading, 0, accelReading.size)
-                  } else if (event.sensor.type == Sensor.TYPE_MAGNETIC_FIELD) {
-                      System.arraycopy(event.values, 0, magReading, 0, magReading.size)
-                  }
-                  if (SensorManager.getRotationMatrix(rotMatrix, null, accelReading, magReading)) {
-                      SensorManager.getOrientation(rotMatrix, orientAngles)
-                      val deg = (Math.toDegrees(orientAngles[0].toDouble()).toFloat() + 360f) % 360f
-                      myHeading = deg
-                  }
-              }
-
-              override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
-          }
-
-          class SpaceRadarView(context: Context) : View(context) {
-              var maxRange = 12f
-              private var nodeList = emptyList<RfNode>()
-              private var heading = 0f
-              private var sweepAngle = 0f
-
-              private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                  color = Color.parseColor("#1E293B")
-                  style = Paint.Style.STROKE
-                  strokeWidth = 3f
-              }
-              private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                  color = Color.parseColor("#CBD5E1")
-                  textSize = 26f
-                  typeface = Typeface.DEFAULT_BOLD
-              }
-              private val subTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                  color = Color.parseColor("#64748B")
-                  textSize = 22f
-              }
-              private val staticPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                  color = Color.parseColor("#38BDF8")
-                  style = Paint.Style.FILL
-              }
-              private val alertPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                  color = Color.parseColor("#EF4444")
-                  style = Paint.Style.FILL
-              }
-              private val wavePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                  color = Color.parseColor("#F87171")
-                  style = Paint.Style.STROKE
-                  strokeWidth = 5f
-              }
-
-              fun updateData(list: List<RfNode>, currentHeading: Float) {
-                  nodeList = list.sortedBy { it.distance }
-                  heading = currentHeading
-                  sweepAngle = (sweepAngle + 6f) % 360f
-                  invalidate()
-              }
-
-              override fun onDraw(canvas: Canvas) {
-                  super.onDraw(canvas)
-                  val cx = width / 2f
-                  val cy = height / 2f
-                  val maxR = min(width, height) * 0.44f
-
-                  // 거리 가이드 링 (25%, 50%, 75%, 100%)
-                  listOf(0.25f, 0.5f, 0.75f, 1.0f).forEach { r ->
-                      val radPx = maxR * r
-                      canvas.drawCircle(cx, cy, radPx, ringPaint)
-                      canvas.drawText("${(maxRange * r).toInt()}m", cx + 10f, cy - radPx + 24f, subTextPaint)
-                  }
-
-                  // 십자선
-                  canvas.drawLine(cx - maxR, cy, cx + maxR, cy, ringPaint)
-                  canvas.drawLine(cx, cy - maxR, cx, cy + maxR, ringPaint)
-
-                  // 중앙 내 폰 위치
-                  canvas.drawCircle(cx, cy, 14f, Paint().apply { color = Color.WHITE })
-
-                  // 감지된 벽 너머 및 주변 전파 신호원 렌더링
-                  for (node in nodeList) {
-                      val normD = (node.distance / maxRange).coerceIn(0.08f, 1.0f)
-                      val rPx = normD * maxR
-                      val relAngle = (node.baseAngle - heading + 360f) % 360f
-                      val rad = Math.toRadians(relAngle.toDouble())
-
-                      val tx = cx + (rPx * sin(rad)).toFloat()
-                      val ty = cy - (rPx * cos(rad)).toFloat()
-
-                      // 신호가 크게 출렁이면(사람 이동/간섭) 빨간색 파동, 고정되어 있으면 파란색
-                      val isMoving = node.fluctuation >= 3.2f
-                      if (isMoving) {
-                          canvas.drawCircle(tx, ty, 38f + node.fluctuation * 4f, wavePaint)
-                          canvas.drawCircle(tx, ty, 20f, alertPaint)
-                      } else {
-                          canvas.drawCircle(tx, ty, 15f, staticPaint)
-                      }
-
-                      canvas.drawText(
-                          "${node.label.take(10)} (${String.format("%.1f", node.distance)}m)",
-                          tx + 22f,
-                          ty + 8f,
-                          textPaint
-                      )
-                  }
-              }
-          }
-          EOF
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: '8.4'
-          cache-disabled: true
-
-      - name: Build Debug APK
-        run: gradle assembleDebug
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: ICAR-Wall-Scanner-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+              // 층 구분 휴리스틱 알고리즘 (콘크리트 슬래브 감쇠 + 틸트 상관도 + 다중경로 특성)
+              private fun classifyFloor(rssi: Int, fluct: Float, freq: Int, pitchCorr: Float, id: String): FloorLevel {
+                  // 1. 사용자가 폰을 위/아래로 기울여 신호 변화가 뚜렷하게 잡힌 경우 우선 반영
+                  if (pitchCorr > 1.2
