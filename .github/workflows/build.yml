@@ -12,19 +12,32 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Auto-fix project structure & properties
+        run: |
+          echo "android.useAndroidX=true" > gradle.properties
+          echo "android.enableJetifier=true" >> gradle.properties
+          echo "org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8" >> gradle.properties
+          
+          mkdir -p app/src/main/java/com/icar/uwbradar
+          
+          # 혹시 폴더 위치가 어긋난 파일이 있으면 자동으로 제자리로 이동
+          find . -name "AndroidManifest.xml" -not -path "./app/src/main/AndroidManifest.xml" -exec mv {} app/src/main/AndroidManifest.xml \; || true
+          find . -name "MainActivity.kt" -not -path "./app/src/main/java/com/icar/uwbradar/MainActivity.kt" -exec mv {} app/src/main/java/com/icar/uwbradar/MainActivity.kt \; || true
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Gradle
+      - name: Setup Gradle (No Cache Error)
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.7'
+          cache-disabled: true
 
       - name: Build Debug APK
-        run: gradle assembleDebug
+        run: gradle assembleDebug --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
