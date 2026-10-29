@@ -9,35 +9,428 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Auto-fix project structure & properties
-        run: |
-          echo "android.useAndroidX=true" > gradle.properties
-          echo "android.enableJetifier=true" >> gradle.properties
-          echo "org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8" >> gradle.properties
-          
-          mkdir -p app/src/main/java/com/icar/uwbradar
-          
-          # 혹시 폴더 위치가 어긋난 파일이 있으면 자동으로 제자리로 이동
-          find . -name "AndroidManifest.xml" -not -path "./app/src/main/AndroidManifest.xml" -exec mv {} app/src/main/AndroidManifest.xml \; || true
-          find . -name "MainActivity.kt" -not -path "./app/src/main/java/com/icar/uwbradar/MainActivity.kt" -exec mv {} app/src/main/java/com/icar/uwbradar/MainActivity.kt \; || true
-
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Gradle (No Cache Error)
+      - name: Generate Clean Project Structure
+        run: |
+          rm -rf *
+          mkdir -p app/src/main/java/com/icar/uwbradar
+
+          cat << 'EOF' > gradle.properties
+          android.useAndroidX=true
+          android.enableJetifier=true
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          EOF
+
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "GalaxyUwbRadar"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.2.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          EOF
+
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.icar.uwbradar"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.icar.uwbradar"
+                  minSdk = 31
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core.uwb:uwb:1.0.0-alpha08")
+              implementation("com.google.android.gms:play-services-nearby:19.3.0")
+              implementation("androidx.core:core-ktx:1.12.0")
+              implementation("androidx.appcompat:appcompat:1.6.1")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.UWB_RANGING" />
+              <uses-permission android:name="android.permission.BLUETOOTH" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
+
+              <uses-feature android:name="android.hardware.uwb" android:required="true" />
+
+              <application
+                  android:label="ICAR UWB Radar"
+                  android:theme="@style/Theme.AppCompat.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/icar/uwbradar/MainActivity.kt
+          package com.icar.uwbradar
+
+          import android.Manifest
+          import android.content.Context
+          import android.graphics.*
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.*
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.app.ActivityCompat
+          import androidx.core.uwb.*
+          import com.google.android.gms.nearby.Nearby
+          import com.google.android.gms.nearby.connection.*
+          import kotlinx.coroutines.*
+          import kotlinx.coroutines.flow.collectLatest
+          import java.nio.ByteBuffer
+          import kotlin.math.cos
+          import kotlin.math.sin
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var uwbManager: UwbManager
+              private lateinit var nearbyClient: ConnectionsClient
+              private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+              private var uwbJob: Job? = null
+
+              private val SERVICE_ID = "com.icar.pure.uwb"
+              private val SESSION_ID = 9001
+              private val SESSION_KEY = byteArrayOf(0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08)
+
+              private var isController = true
+              private var sessionScope: UwbClientSessionScope? = null
+              private var controllerScope: UwbControllerSessionScope? = null
+
+              private lateinit var statusTv: TextView
+              private lateinit var metricsTv: TextView
+              private lateinit var radarView: RadarCanvasView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  uwbManager = UwbManager.createInstance(this)
+                  nearbyClient = Nearby.getConnectionsClient(this)
+
+                  requestAllPermissions()
+                  setupUi()
+              }
+
+              private fun requestAllPermissions() {
+                  val perms = mutableListOf(
+                      Manifest.permission.UWB_RANGING,
+                      Manifest.permission.ACCESS_FINE_LOCATION,
+                      Manifest.permission.ACCESS_COARSE_LOCATION
+                  )
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                      perms.addAll(listOf(
+                          Manifest.permission.BLUETOOTH_SCAN,
+                          Manifest.permission.BLUETOOTH_ADVERTISE,
+                          Manifest.permission.BLUETOOTH_CONNECT
+                      ))
+                  }
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                      perms.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+                  }
+                  ActivityCompat.requestPermissions(this, perms.toTypedArray(), 100)
+              }
+
+              private fun setupUi() {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.parseColor("#080B10"))
+                      setPadding(40, 50, 40, 40)
+                  }
+
+                  val title = TextView(this).apply {
+                      text = "ICAR PURE UWB RADAR"
+                      setTextColor(Color.parseColor("#38BDF8"))
+                      textSize = 20f
+                      gravity = Gravity.CENTER
+                      typeface = Typeface.DEFAULT_BOLD
+                  }
+
+                  statusTv = TextView(this).apply {
+                      text = "하단 버튼으로 폰A(호스트) / 폰B(게스트) 시작"
+                      setTextColor(Color.parseColor("#94A3B8"))
+                      textSize = 13f
+                      gravity = Gravity.CENTER
+                      setPadding(0, 12, 0, 24)
+                  }
+
+                  radarView = RadarCanvasView(this).apply {
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+                      )
+                  }
+
+                  metricsTv = TextView(this).apply {
+                      text = "거리: -- m   |   방위각: -- °   |   고도: -- °"
+                      setTextColor(Color.WHITE)
+                      textSize = 16f
+                      gravity = Gravity.CENTER
+                      typeface = Typeface.DEFAULT_BOLD
+                      setPadding(20, 32, 20, 32)
+                  }
+
+                  val btnRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                  }
+
+                  val btnHost = Button(this).apply {
+                      text = "폰A: 호스트 시작"
+                      setBackgroundColor(Color.parseColor("#0284C7"))
+                      setTextColor(Color.WHITE)
+                      layoutParams = LinearLayout.LayoutParams(0, 140, 1f).apply { rightMargin = 16 }
+                      setOnClickListener { startRole(true) }
+                  }
+
+                  val btnGuest = Button(this).apply {
+                      text = "폰B: 게스트 시작"
+                      setBackgroundColor(Color.parseColor("#4F46E5"))
+                      setTextColor(Color.WHITE)
+                      layoutParams = LinearLayout.LayoutParams(0, 140, 1f)
+                      setOnClickListener { startRole(false) }
+                  }
+
+                  btnRow.addView(btnHost)
+                  btnRow.addView(btnGuest)
+
+                  root.addView(title)
+                  root.addView(statusTv)
+                  root.addView(radarView)
+                  root.addView(metricsTv)
+                  root.addView(btnRow)
+
+                  setContentView(root)
+              }
+
+              private fun startRole(asController: Boolean) {
+                  uwbJob?.cancel()
+                  nearbyClient.stopAdvertising()
+                  nearbyClient.stopDiscovery()
+                  nearbyClient.stopAllEndpoints()
+                  isController = asController
+
+                  scope.launch {
+                      try {
+                          if (asController) {
+                              statusTv.text = "UWB 호스트 준비 완료. 상대 갤럭시 탐색 중..."
+                              controllerScope = uwbManager.controllerSessionScope()
+                              sessionScope = controllerScope
+                              val opt = DiscoveryOptions.Builder().setStrategy(Strategy.P2P_POINT_TO_POINT).build()
+                              nearbyClient.startDiscovery(SERVICE_ID, discoveryCb, opt)
+                          } else {
+                              statusTv.text = "UWB 게스트 준비 완료. 호스트 신호 대기 중..."
+                              sessionScope = uwbManager.controleeSessionScope()
+                              val opt = AdvertisingOptions.Builder().setStrategy(Strategy.P2P_POINT_TO_POINT).build()
+                              nearbyClient.startAdvertising("UWB_Guest", SERVICE_ID, connCb, opt)
+                          }
+                      } catch (e: Exception) {
+                          statusTv.text = "오류: 기기 설정에서 초광대역(UWB)을 켜주세요."
+                      }
+                  }
+              }
+
+              private val discoveryCb = object : EndpointDiscoveryCallback() {
+                  override fun onEndpointFound(id: String, info: DiscoveredEndpointInfo) {
+                      statusTv.text = "상대 갤럭시 발견! UWB 채널 교환 중..."
+                      nearbyClient.requestConnection("UWB_Host", id, connCb)
+                  }
+                  override fun onEndpointLost(id: String) {}
+              }
+
+              private val connCb = object : ConnectionLifecycleCallback() {
+                  override fun onConnectionInitiated(id: String, info: ConnectionInfo) {
+                      nearbyClient.acceptConnection(id, payloadCb)
+                  }
+                  override fun onConnectionResult(id: String, res: ConnectionResolution) {
+                      if (res.status.isSuccess) {
+                          nearbyClient.stopAdvertising()
+                          nearbyClient.stopDiscovery()
+                          val localAddr = sessionScope?.localAddress?.address ?: return
+                          if (isController) {
+                              val ch = controllerScope?.uwbComplexChannel ?: return
+                              val buf = ByteBuffer.allocate(1 + localAddr.size + 8)
+                              buf.put(localAddr.size.toByte()).put(localAddr).putInt(ch.channel).putInt(ch.preambleIndex)
+                              nearbyClient.sendPayload(id, Payload.fromBytes(buf.array()))
+                          } else {
+                              val buf = ByteBuffer.allocate(1 + localAddr.size)
+                              buf.put(localAddr.size.toByte()).put(localAddr)
+                              nearbyClient.sendPayload(id, Payload.fromBytes(buf.array()))
+                          }
+                      }
+                  }
+                  override fun onDisconnected(id: String) {}
+              }
+
+              private val payloadCb = object : PayloadCallback() {
+                  override fun onPayloadReceived(id: String, payload: Payload) {
+                      val bytes = payload.asBytes() ?: return
+                      val buf = ByteBuffer.wrap(bytes)
+                      val len = buf.get().toInt()
+                      val peerAddr = ByteArray(len)
+                      buf.get(peerAddr)
+
+                      if (isController) {
+                          val ch = controllerScope?.uwbComplexChannel ?: return
+                          runUwbRanging(peerAddr, ch.channel, ch.preambleIndex)
+                      } else {
+                          runUwbRanging(peerAddr, buf.int, buf.int)
+                      }
+                  }
+                  override fun onPayloadTransferUpdate(id: String, u: PayloadTransferUpdate) {}
+              }
+
+              private fun runUwbRanging(peerAddr: ByteArray, channel: Int, preamble: Int) {
+                  uwbJob?.cancel()
+                  uwbJob = scope.launch {
+                      val s = sessionScope ?: return@launch
+                      val params = RangingParameters(
+                          uwbConfigType = RangingParameters.CONFIG_UNICAST_DS_TWR,
+                          sessionId = SESSION_ID,
+                          subSessionId = 0,
+                          sessionKeyInfo = SESSION_KEY,
+                          subSessionKeyInfo = null,
+                          complexChannel = UwbComplexChannel(channel, preamble),
+                          peerDevices = listOf(UwbDevice(UwbAddress(peerAddr))),
+                          updateRateType = RangingParameters.RANGING_UPDATE_RATE_FREQUENT
+                      )
+
+                      statusTv.text = "UWB 하드웨어 실시간 추적 중!"
+                      statusTv.setTextColor(Color.parseColor("#4ADE80"))
+
+                      s.prepareSession(params).collectLatest { result ->
+                          when (result) {
+                              is RangingResult.RangingResultPosition -> {
+                                  val pos = result.position
+                                  val d = pos.distance?.value ?: 0f
+                                  val az = pos.azimuth?.value ?: 0f
+                                  val el = pos.elevation?.value ?: 0f
+                                  metricsTv.text = String.format("거리: %.2f m  |  방위각: %+.1f°  |  고도: %+.1f°", d, az, el)
+                                  radarView.updateTarget(true, d, az)
+                              }
+                              is RangingResult.RangingResultPeerDisconnected -> {
+                                  statusTv.text = "UWB 연결 끊김"
+                                  radarView.updateTarget(false, 0f, 0f)
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          class RadarCanvasView(context: Context) : View(context) {
+              private var active = false
+              private var dist = 0f
+              private var azimuth = 0f
+              private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.parseColor("#1E293B")
+                  style = Paint.Style.STROKE
+                  strokeWidth = 4f
+              }
+              private val targetPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.parseColor("#4ADE80")
+                  style = Paint.Style.FILL
+              }
+              private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.parseColor("#38BDF8")
+                  strokeWidth = 6f
+              }
+
+              fun updateTarget(isActive: Boolean, d: Float, az: Float) {
+                  active = isActive
+                  dist = d
+                  azimuth = az
+                  invalidate()
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  super.onDraw(canvas)
+                  val cx = width / 2f
+                  val cy = height * 0.82f
+                  val maxR = width * 0.44f
+
+                  listOf(0.25f, 0.5f, 0.75f, 1.0f).forEach { r ->
+                      canvas.drawCircle(cx, cy, maxR * r, gridPaint)
+                  }
+                  canvas.drawCircle(cx, cy, 14f, Paint().apply { color = Color.WHITE })
+
+                  if (active) {
+                      val normD = (dist / 6f).coerceIn(0.02f, 1f)
+                      val rPx = normD * maxR
+                      val rad = Math.toRadians(azimuth.toDouble())
+                      val tx = cx + (rPx * sin(rad)).toFloat()
+                      val ty = cy - (rPx * cos(rad)).toFloat()
+
+                      canvas.drawLine(cx, cy, tx, ty, linePaint)
+                      canvas.drawCircle(tx, ty, 28f, targetPaint)
+                  }
+              }
+          }
+          EOF
+
+      - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
         with:
-          gradle-version: '8.7'
+          gradle-version: '8.6'
           cache-disabled: true
 
       - name: Build Debug APK
-        run: gradle assembleDebug --stacktrace
+        run: gradle assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
