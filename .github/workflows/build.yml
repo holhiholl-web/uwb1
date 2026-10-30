@@ -15,80 +15,23 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Accept Android SDK Licenses
-        run: |
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.4'
+          cache-disabled: true
 
-      - name: Generate v3 Project Structure
+      - name: Generate and Build v3 APK
         run: |
           rm -rf *
           mkdir -p app/src/main/java/com/icar/uwbradar
+          printf "android.useAndroidX=true\nandroid.enableJetifier=true\norg.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8\n" > gradle.properties
+          printf 'pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }\ndependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }\nrootProject.name = "ICARWallRadarV3"\ninclude(":app")\n' > settings.gradle.kts
+          printf 'plugins {\n id("com.android.application") version "8.2.2" apply false\n id("org.jetbrains.kotlin.android") version "1.9.22" apply false\n}\n' > build.gradle.kts
+          printf 'plugins {\n id("com.android.application")\n id("org.jetbrains.kotlin.android")\n}\nandroid {\n namespace = "com.icar.uwbradar"\n compileSdk = 34\n defaultConfig {\n applicationId = "com.icar.wallradar"\n minSdk = 29\n targetSdk = 34\n versionCode = 3\n versionName = "3.0"\n }\n compileOptions {\n sourceCompatibility = JavaVersion.VERSION_17\n targetCompatibility = JavaVersion.VERSION_17\n }\n kotlinOptions { jvmTarget = "17" }\n}\ndependencies {\n implementation("androidx.core:core-ktx:1.12.0")\n implementation("androidx.appcompat:appcompat:1.6.1")\n}\n' > app/build.gradle.kts
 
-          cat << 'EOF' > gradle.properties
-          android.useAndroidX=true
-          android.enableJetifier=true
-          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
-          EOF
-
-          cat << 'EOF' > settings.gradle.kts
-          pluginManagement {
-              repositories {
-                  google()
-                  mavenCentral()
-                  gradlePluginPortal()
-              }
-          }
-          dependencyResolutionManagement {
-              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-              repositories {
-                  google()
-                  mavenCentral()
-              }
-          }
-          rootProject.name = "ICARWallRadarV3"
-          include(":app")
-          EOF
-
-          cat << 'EOF' > build.gradle.kts
-          plugins {
-              id("com.android.application") version "8.2.2" apply false
-              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
-          }
-          EOF
-
-          cat << 'EOF' > app/build.gradle.kts
-          plugins {
-              id("com.android.application")
-              id("org.jetbrains.kotlin.android")
-          }
-
-          android {
-              namespace = "com.icar.uwbradar"
-              compileSdk = 34
-
-              defaultConfig {
-                  applicationId = "com.icar.wallradar"
-                  minSdk = 29
-                  targetSdk = 34
-                  versionCode = 3
-                  versionName = "3.0"
-              }
-
-              compileOptions {
-                  sourceCompatibility = JavaVersion.VERSION_17
-                  targetCompatibility = JavaVersion.VERSION_17
-              }
-              kotlinOptions {
-                  jvmTarget = "17"
-              }
-          }
-
-          dependencies {
-              implementation("androidx.core:core-ktx:1.12.0")
-              implementation("androidx.appcompat:appcompat:1.6.1")
-          }
-          EOF
-
+      - name: Write AndroidManifest and MainActivity
+        run: |
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -102,14 +45,8 @@ jobs:
               <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
               <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
               <uses-permission android:name="android.permission.WAKE_LOCK" />
-
-              <application
-                  android:label="ICAR 공간레이더 PRO"
-                  android:theme="@style/Theme.AppCompat.NoActionBar">
-                  <activity
-                      android:name=".MainActivity"
-                      android:exported="true"
-                      android:screenOrientation="portrait">
+              <application android:label="ICAR 공간레이더 PRO" android:theme="@style/Theme.AppCompat.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true" android:screenOrientation="portrait">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
@@ -143,11 +80,10 @@ jobs:
           import java.util.concurrent.ConcurrentHashMap
           import kotlin.math.*
 
-          // 층 구분 열거형: 같은층(BLUE), 위층(YELLOW), 아래층(GREEN)
           enum class FloorLevel(val label: String, val colorHex: String) {
-              SAME("동일층", "#38BDF8"),   // 블루
-              UPPER("위층▲", "#FACC15"),   // 노란색
-              LOWER("아래층▼", "#4ADE80")  // 녹색
+              SAME("동일층", "#38BDF8"),
+              UPPER("위층▲", "#FACC15"),
+              LOWER("아래층▼", "#4ADE80")
           }
 
           data class RfNode(
@@ -166,26 +102,22 @@ jobs:
           )
 
           class MainActivity : AppCompatActivity(), SensorEventListener {
-
               private val nodes = ConcurrentHashMap<String, RfNode>()
               private lateinit var radarView: InteractiveRadarView
               private lateinit var listContainer: LinearLayout
               private lateinit var statusTv: TextView
               private lateinit var btnBooster: Button
-
               private lateinit var sensorManager: SensorManager
               private var myHeading = 0f
-              private var myPitch = 0f // 폰 위아래 기울기 (층 감지 보정용)
+              private var myPitch = 0f
               private val accel = FloatArray(3)
               private val mag = FloatArray(3)
               private val rotMatrix = FloatArray(9)
               private val orient = FloatArray(3)
-
               private val uiHandler = Handler(Looper.getMainLooper())
               private var isScanning = false
               private var isBoosterMode = false
               private var selectedNodeId: String? = null
-
               private var wakeLock: PowerManager.WakeLock? = null
               private var wifiLock: WifiManager.WifiLock? = null
               private var lastBleRestart = 0L
@@ -221,8 +153,6 @@ jobs:
                       setBackgroundColor(Color.parseColor("#070A0F"))
                       setPadding(24, 36, 24, 24)
                   }
-
-                  // 상단 타이틀 & 범례
                   val title = TextView(this).apply {
                       text = "ICAR 공간·벽면 투과 레이더 v3.0"
                       setTextColor(Color.parseColor("#38BDF8"))
@@ -230,7 +160,6 @@ jobs:
                       typeface = Typeface.DEFAULT_BOLD
                       gravity = Gravity.CENTER
                   }
-
                   val legend = TextView(this).apply {
                       text = "● 동일층(블루)  ● 위층(노랑)  ● 아래층(녹색)  〰 벽면전파굴절"
                       setTextColor(Color.parseColor("#CBD5E1"))
@@ -238,33 +167,23 @@ jobs:
                       gravity = Gravity.CENTER
                       setPadding(0, 6, 0, 8)
                   }
-
                   statusTv = TextView(this).apply {
-                      text = "두 손가락으로 레이더 확대/축소 가능 | 좌측 리스트 상하 스크롤"
+                      text = "두 손가락으로 레이더 확대/축소 | 좌측 리스트 상하 스크롤"
                       setTextColor(Color.parseColor("#94A3B8"))
                       textSize = 11f
                       gravity = Gravity.CENTER
                       setPadding(0, 0, 0, 14)
                   }
-
-                  // 중단 메인 영역: [좌측 10개 단위 스크롤 리스트 (38%)] + [우측 멀티터치 레이더 (62%)]
                   val middleRow = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
-                      layoutParams = LinearLayout.LayoutParams(
-                          LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
-                      )
+                      layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
                   }
-
-                  // 좌측 리스트 패널
                   val leftPanel = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                       setBackgroundColor(Color.parseColor("#0F172A"))
                       setPadding(12, 12, 12, 12)
-                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 0.40f).apply {
-                          rightMargin = 12
-                      }
+                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 0.40f).apply { rightMargin = 12 }
                   }
-
                   val listHeader = TextView(this).apply {
                       text = "감지 목록 (스크롤)"
                       setTextColor(Color.parseColor("#38BDF8"))
@@ -272,36 +191,24 @@ jobs:
                       typeface = Typeface.DEFAULT_BOLD
                       setPadding(4, 0, 4, 8)
                   }
-
                   val scrollView = ScrollView(this).apply {
-                      layoutParams = LinearLayout.LayoutParams(
-                          LinearLayout.LayoutParams.MATCH_PARENT,
-                          LinearLayout.LayoutParams.MATCH_PARENT
-                      )
-                      isVerticalScrollBarEnabled = true
+                      layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT)
                   }
-
-                  listContainer = LinearLayout(this).apply {
-                      orientation = LinearLayout.VERTICAL
-                  }
+                  listContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
                   scrollView.addView(listContainer)
                   leftPanel.addView(listHeader)
                   leftPanel.addView(scrollView)
 
-                  // 우측 멀티터치 줌 레이더 뷰
                   radarView = InteractiveRadarView(this).apply {
                       layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 0.60f)
                   }
-
                   middleRow.addView(leftPanel)
                   middleRow.addView(radarView)
 
-                  // 하단 컨트롤 버튼 바
                   val btnRow = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       setPadding(0, 16, 0, 0)
                   }
-
                   val btnScan = Button(this).apply {
                       text = "스캔 시작"
                       setBackgroundColor(Color.parseColor("#0284C7"))
@@ -310,7 +217,6 @@ jobs:
                       layoutParams = LinearLayout.LayoutParams(0, 125, 1f).apply { rightMargin = 10 }
                       setOnClickListener { startRadarScan() }
                   }
-
                   btnBooster = Button(this).apply {
                       text = "⚡ 부스터: OFF"
                       setBackgroundColor(Color.parseColor("#334155"))
@@ -319,7 +225,6 @@ jobs:
                       layoutParams = LinearLayout.LayoutParams(0, 125, 1.1f).apply { rightMargin = 10 }
                       setOnClickListener { toggleBoosterMode() }
                   }
-
                   val btnResetZoom = Button(this).apply {
                       text = "줌 초기화"
                       setBackgroundColor(Color.parseColor("#1E293B"))
@@ -328,7 +233,6 @@ jobs:
                       layoutParams = LinearLayout.LayoutParams(0, 125, 0.75f)
                       setOnClickListener { radarView.resetView() }
                   }
-
                   btnRow.addView(btnScan)
                   btnRow.addView(btnBooster)
                   btnRow.addView(btnResetZoom)
@@ -338,7 +242,6 @@ jobs:
                   root.addView(statusTv)
                   root.addView(middleRow)
                   root.addView(btnRow)
-
                   setContentView(root)
               }
 
@@ -346,24 +249,20 @@ jobs:
               private fun toggleBoosterMode() {
                   isBoosterMode = !isBoosterMode
                   if (isBoosterMode) {
-                      btnBooster.text = "⚡ 부스터: ON (최대출력)"
+                      btnBooster.text = "⚡ 부스터: ON"
                       btnBooster.setBackgroundColor(Color.parseColor("#DC2626"))
-                      statusTv.text = "⚡ 부스터 가동! 하드웨어 절전 해제 및 초고빈도 연속 전파 스캔 중"
+                      statusTv.text = "⚡ 부스터 풀파워 연속 스캔 가동 중!"
                       statusTv.setTextColor(Color.parseColor("#F87171"))
-
                       val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-                      wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ICAR:BoosterWakeLock").apply { acquire() }
-
+                      wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ICAR:Wake").apply { acquire() }
                       val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-                      wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "ICAR:BoosterWifiLock").apply { acquire() }
-
+                      wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "ICAR:Wifi").apply { acquire() }
                       if (!isScanning) startRadarScan() else restartBleScanner()
                   } else {
                       btnBooster.text = "⚡ 부스터: OFF"
                       btnBooster.setBackgroundColor(Color.parseColor("#334155"))
-                      statusTv.text = "일반 스캔 모드로 전환됨"
+                      statusTv.text = "일반 스캔 모드"
                       statusTv.setTextColor(Color.parseColor("#4ADE80"))
-
                       try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (e: Exception) {}
                       try { if (wifiLock?.isHeld == true) wifiLock?.release() } catch (e: Exception) {}
                       if (isScanning) restartBleScanner()
@@ -373,7 +272,7 @@ jobs:
               @SuppressLint("MissingPermission")
               private fun startRadarScan() {
                   isScanning = true
-                  statusTv.text = if (isBoosterMode) "⚡ 부스터 풀파워 스캔 가동 중!" else "실시간 공간·벽면 스캔 가동 중! (폰을 위아래로 기울이면 층 구분이 정밀해집니다)"
+                  statusTv.text = "실시간 공간·벽면 스캔 가동 중!"
                   statusTv.setTextColor(Color.parseColor("#4ADE80"))
                   restartBleScanner()
                   uiHandler.removeCallbacks(scanLoop)
@@ -386,11 +285,9 @@ jobs:
                       val btMgr = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
                       val scanner = btMgr.adapter?.bluetoothLeScanner ?: return
                       scanner.stopScan(bleCallback)
-
                       val builder = ScanSettings.Builder()
                           .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
                           .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
-
                       if (isBoosterMode) {
                           builder.setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
                           builder.setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
@@ -398,9 +295,7 @@ jobs:
                       }
                       scanner.startScan(null, builder.build(), bleCallback)
                       lastBleRestart = System.currentTimeMillis()
-                  } catch (e: Exception) {
-                      statusTv.text = "블루투스 및 위치(GPS) 권한과 스위치를 켜주세요."
-                  }
+                  } catch (e: Exception) {}
               }
 
               private val bleCallback = object : ScanCallback() {
@@ -417,13 +312,8 @@ jobs:
               private val scanLoop = object : Runnable {
                   override fun run() {
                       if (!isScanning) return
-
                       val now = System.currentTimeMillis()
-                      // 부스터 모드일 때는 안드로이드 스캔 쓰로틀링 방지를 위해 2.8초마다 BLE 스캐너 강제 재점화
-                      if (isBoosterMode && now - lastBleRestart > 2800) {
-                          restartBleScanner()
-                      }
-
+                      if (isBoosterMode && now - lastBleRestart > 2800) restartBleScanner()
                       try {
                           val wifiMgr = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
                           wifiMgr.startScan()
@@ -436,13 +326,10 @@ jobs:
 
                       val expireMs = if (isBoosterMode) 12000L else 8000L
                       nodes.entries.removeIf { now - it.value.lastSeen > expireMs }
-
                       val sorted = nodes.values.sortedBy { it.distance }
                       updateLeftScrollList(sorted)
                       radarView.updateData(sorted, myHeading, selectedNodeId)
-
-                      val interval = if (isBoosterMode) 65L else 140L
-                      uiHandler.postDelayed(this, interval)
+                      uiHandler.postDelayed(this, if (isBoosterMode) 65L else 140L)
                   }
               }
 
@@ -450,31 +337,202 @@ jobs:
                   val now = System.currentTimeMillis()
                   val dist = estimateDistance(newRssi, freq)
                   val existing = nodes[id]
-
                   if (existing == null) {
                       val hashAngle = ((id.hashCode() and 0x7FFFFFFF) % 360).toFloat()
-                      val initialFloor = classifyFloor(newRssi, 1.5f, freq, 0f, id)
-                      nodes[id] = RfNode(id, label, type, freq, newRssi, newRssi.toFloat(), 1.0f, dist, hashAngle, initialFloor, 0f, now)
+                      val fl = classifyFloor(newRssi, 1.5f, freq, 0f, id)
+                      nodes[id] = RfNode(id, label, type, freq, newRssi, newRssi.toFloat(), 1.0f, dist, hashAngle, fl, 0f, now)
                   } else {
-                      val deltaRssi = newRssi - existing.smoothRssi
-                      val diff = abs(deltaRssi)
-                      existing.fluctuation = existing.fluctuation * 0.65f + diff * 0.35f
+                      val delta = newRssi - existing.smoothRssi
+                      existing.fluctuation = existing.fluctuation * 0.65f + abs(delta) * 0.35f
                       existing.smoothRssi = existing.smoothRssi * 0.72f + newRssi * 0.28f
                       existing.rssi = newRssi
                       existing.distance = estimateDistance(existing.smoothRssi.toInt(), freq)
-
-                      // 폰을 위(천장, myPitch < -15)나 아래(바닥, myPitch > 15)로 기울일 때 신호 증감 상관관계 누적
                       if (abs(myPitch) > 12f) {
-                          val pitchSign = if (myPitch < 0) 1f else -1f // 위를 향하면 +1, 아래를 향하면 -1
-                          existing.pitchCorrelation = (existing.pitchCorrelation * 0.85f) + (deltaRssi * pitchSign * 0.15f)
+                          val pSign = if (myPitch < 0) 1f else -1f
+                          existing.pitchCorrelation = existing.pitchCorrelation * 0.85f + (delta * pSign * 0.15f)
                       }
-
                       existing.floor = classifyFloor(existing.smoothRssi.toInt(), existing.fluctuation, freq, existing.pitchCorrelation, id)
                       existing.lastSeen = now
                   }
               }
 
-              // 층 구분 휴리스틱 알고리즘 (콘크리트 슬래브 감쇠 + 틸트 상관도 + 다중경로 특성)
               private fun classifyFloor(rssi: Int, fluct: Float, freq: Int, pitchCorr: Float, id: String): FloorLevel {
-                  // 1. 사용자가 폰을 위/아래로 기울여 신호 변화가 뚜렷하게 잡힌 경우 우선 반영
-                  if (pitchCorr > 1.2
+                  if (pitchCorr > 1.2f) return FloorLevel.UPPER
+                  if (pitchCorr < -1.2f) return FloorLevel.LOWER
+                  if (rssi >= -67) return FloorLevel.SAME
+                  val m = (id.hashCode() and 0x7FFFFFFF) % 10
+                  return when {
+                      rssi < -74 && (freq >= 5000 || fluct >= 1.8f) && m < 5 -> FloorLevel.UPPER
+                      rssi < -74 && m >= 5 -> FloorLevel.LOWER
+                      else -> FloorLevel.SAME
+                  }
+              }
+
+              private fun estimateDistance(rssi: Int, freq: Int): Float {
+                  val tx = if (freq >= 5000) -55.0 else -59.0
+                  return 10.0.pow((tx - rssi) / (10.0 * 2.65)).toFloat().coerceIn(0.3f, 35.0f)
+              }
+
+              private fun updateLeftScrollList(list: List<RfNode>) {
+                  listContainer.removeAllViews()
+                  val itemH = (radarView.height / 10.5f).toInt().coerceAtLeast(68)
+                  list.forEachIndexed { idx, node ->
+                      val num = idx + 1
+                      val itemLayout = LinearLayout(this).apply {
+                          orientation = LinearLayout.VERTICAL
+                          layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, itemH).apply { bottomMargin = 6 }
+                          setPadding(10, 6, 10, 6)
+                          setBackgroundColor(if (node.id == selectedNodeId) Color.parseColor("#1E293B") else Color.parseColor("#131C2E"))
+                          setOnClickListener {
+                              selectedNodeId = if (selectedNodeId == node.id) null else node.id
+                              radarView.invalidate()
+                          }
+                      }
+                      val topLine = TextView(this).apply {
+                          text = "#$num ${node.label.take(9)}"
+                          setTextColor(Color.parseColor(node.floor.colorHex))
+                          textSize = 11.5f
+                          typeface = Typeface.DEFAULT_BOLD
+                          setSingleLine(true)
+                      }
+                      val moveTag = if (node.fluctuation >= 2.2f) "〰벽반사" else ""
+                      val subLine = TextView(this).apply {
+                          text = "${String.format("%.1fm", node.distance)} | ${node.floor.label} $moveTag"
+                          setTextColor(Color.parseColor("#94A3B8"))
+                          textSize = 9.5f
+                          setSingleLine(true)
+                      }
+                      itemLayout.addView(topLine)
+                      itemLayout.addView(subLine)
+                      listContainer.addView(itemLayout)
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.also { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+                  sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)?.also { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  sensorManager.unregisterListener(this)
+              }
+
+              override fun onSensorChanged(event: SensorEvent) {
+                  if (event.sensor.type == Sensor.TYPE_ACCELEROMETER) System.arraycopy(event.values, 0, accel, 0, accel.size)
+                  else if (event.sensor.type == Sensor.TYPE_MAGNETIC_FIELD) System.arraycopy(event.values, 0, mag, 0, mag.size)
+                  if (SensorManager.getRotationMatrix(rotMatrix, null, accel, mag)) {
+                      SensorManager.getOrientation(rotMatrix, orient)
+                      myHeading = (Math.toDegrees(orient[0].toDouble()).toFloat() + 360f) % 360f
+                      myPitch = Math.toDegrees(orient[1].toDouble()).toFloat()
+                  }
+              }
+
+              override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+          }
+
+          class InteractiveRadarView(context: Context) : View(context) {
+              private var nodeList = emptyList<RfNode>()
+              private var heading = 0f
+              private var selectedId: String? = null
+              private var phase = 0f
+              private var zoomScale = 1.0f
+              private var panX = 0f
+              private var panY = 0f
+              private var lastX = 0f
+              private var lastY = 0f
+              private val baseMaxRange = 14f
+
+              private val scaleDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                  override fun onScale(d: ScaleGestureDetector): Boolean {
+                      zoomScale = (zoomScale * d.scaleFactor).coerceIn(0.5f, 6.0f)
+                      invalidate()
+                      return true
+                  }
+              })
+
+              private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#1E293B"); style = Paint.Style.STROKE; strokeWidth = 2.5f }
+              private val wallPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#6622D3EE"); style = Paint.Style.STROKE; strokeWidth = 4.5f; strokeCap = Paint.Cap.ROUND }
+              private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; textSize = 23f; typeface = Typeface.DEFAULT_BOLD }
+              private val subPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#64748B"); textSize = 20f }
+
+              fun resetView() { zoomScale = 1.0f; panX = 0f; panY = 0f; invalidate() }
+
+              fun updateData(list: List<RfNode>, h: Float, sel: String?) {
+                  nodeList = list; heading = h; selectedId = sel; phase += 0.38f; invalidate()
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  scaleDetector.onTouchEvent(e)
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> { lastX = e.x; lastY = e.y }
+                      MotionEvent.ACTION_MOVE -> {
+                          if (!scaleDetector.isInProgress && e.pointerCount == 1) {
+                              panX += e.x - lastX; panY += e.y - lastY; lastX = e.x; lastY = e.y; invalidate()
+                          }
+                      }
+                  }
+                  return true
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  super.onDraw(canvas)
+                  val cx = width / 2f + panX
+                  val cy = height / 2f + panY
+                  val maxR = min(width, height) * 0.44f * zoomScale
+
+                  listOf(0.25f, 0.5f, 0.75f, 1.0f).forEach { r ->
+                      val radPx = maxR * r
+                      canvas.drawCircle(cx, cy, radPx, gridPaint)
+                      canvas.drawText(String.format("%.1fm", baseMaxRange * r), cx + 8f, cy - radPx + 20f, subPaint)
+                  }
+                  canvas.drawLine(cx - maxR, cy, cx + maxR, cy, gridPaint)
+                  canvas.drawLine(cx, cy - maxR, cx, cy + maxR, gridPaint)
+                  canvas.drawText("Zoom: ${String.format("%.1fx", zoomScale)}", 20f, 36f, subPaint)
+                  canvas.drawCircle(cx, cy, 12f, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE })
+
+                  nodeList.forEachIndexed { idx, node ->
+                      val num = idx + 1
+                      val rPx = (node.distance / baseMaxRange).coerceIn(0.05f, 1.2f) * maxR
+                      val rad = Math.toRadians(((node.baseAngle - heading + 360f) % 360f).toDouble())
+                      val tx = cx + (rPx * sin(rad)).toFloat()
+                      val ty = cy - (rPx * cos(rad)).toFloat()
+
+                      if (node.fluctuation >= 1.2f && node.distance > 1.2f) {
+                          val wallR = rPx * 0.78f
+                          val perp = rad + Math.PI / 2.0
+                          val halfW = (34f + node.fluctuation * 8f) * zoomScale.coerceAtMost(2.5f)
+                          val wx = cx + (wallR * sin(rad)).toFloat()
+                          val wy = cy - (wallR * cos(rad)).toFloat()
+                          val path = Path()
+                          for (s in -12..12) {
+                              val off = (s / 12f) * halfW
+                              val rip = sin(phase + s * 0.9f) * (node.fluctuation * 2.2f)
+                              val px = wx + (off * sin(perp)).toFloat() + (rip * sin(rad)).toFloat()
+                              val py = wy - (off * cos(perp)).toFloat() - (rip * cos(rad)).toFloat()
+                              if (s == -12) path.moveTo(px, py) else path.lineTo(px, py)
+                          }
+                          canvas.drawPath(path, wallPaint)
+                      }
+
+                      if (node.id == selectedId) {
+                          canvas.drawCircle(tx, ty, 24f, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = 4f })
+                      }
+                      canvas.drawCircle(tx, ty, 13f, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor(node.floor.colorHex) })
+                      canvas.drawText("#$num", tx + 16f, ty + 8f, labelPaint)
+                  }
+              }
+          }
+          EOF
+
+      - name: Accept Android Licenses and Build APK
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          gradle assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ICAR-Wall-Scanner-v3-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
